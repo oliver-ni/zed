@@ -14,6 +14,7 @@ path = "src/jj_ui.rs"
 [dependencies]
 anyhow.workspace = true
 collections.workspace = true
+git_ui.workspace = true
 gpui.workspace = true
 jj.workspace = true
 log.workspace = true

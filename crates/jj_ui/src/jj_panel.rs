@@ -6,6 +6,7 @@ use gpui::{
     Pixels, Point, SharedString, Subscription, Task, UniformListScrollHandle, WeakEntity, Window,
     anchored, canvas, deferred, div, point, px, uniform_list,
 };
+use git_ui::commit_view::CommitView;
 use jj::{JjBookmark, JjGraphEdge, JjLogEntry, JjRepository};
 use project::{Project, Worktree};
 use settings::Settings;
@@ -152,8 +153,6 @@ pub struct JjPanel {
     revset: String,
 
     selected_ix: Option<usize>,
-    /// Row currently being hovered by a drag. Shown with a drop-target highlight.
-    drag_target_ix: Option<usize>,
 
     context_menu: Option<(Entity<ContextMenu>, Point<Pixels>, Subscription)>,
 
@@ -212,7 +211,6 @@ impl JjPanel {
                 state: PanelState::NotAJjRepo,
                 revset: String::new(),
                 selected_ix: None,
-                drag_target_ix: None,
                 context_menu: None,
                 scroll_handle: UniformListScrollHandle::new(),
                 width: None,
@@ -486,6 +484,28 @@ impl JjPanel {
         self.run_mutation("undo", |repo| async move { repo.undo().await }, cx);
     }
 
+    /// Open Zed's built-in commit inspector for the given git commit SHA.
+    ///
+    /// This reuses `git_ui::CommitView`, which needs a git `Repository` entity.
+    /// Colocated jj repos (`.git/` next to `.jj/`) get picked up by Zed's git
+    /// integration automatically, so `active_repository` is populated. Pure-jj
+    /// repos with no `.git/` won't have one; this is a no-op there.
+    fn open_commit_view(&self, commit_id: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(repo) = self.project.read(cx).active_repository(cx) else {
+            log::debug!("no active git repository — commit inspector unavailable");
+            return;
+        };
+        CommitView::open(
+            commit_id.to_string(),
+            repo.downgrade(),
+            self.workspace.clone(),
+            None,
+            None,
+            window,
+            cx,
+        );
+    }
+
     // ─── Context menu ──────────────────────────────────────────────────────
 
     fn deploy_context_menu(
@@ -591,13 +611,13 @@ impl JjPanel {
     ) -> impl IntoElement + use<> {
         let rev = &entry.revision;
         let is_selected = self.selected_ix == Some(ix);
-        let is_drag_target = self.drag_target_ix == Some(ix);
         let is_focused = self.focus_handle.is_focused(window);
 
         let target_change = rev.change_id.clone();
         let target_change_for_rev = target_change.clone();
         let target_change_for_bm = target_change.clone();
         let target_change_for_click = target_change.clone();
+        let commit_id_for_view = rev.commit_id.clone();
 
         let drag_payload = DraggedJjRevision {
             change_id: rev.change_id.clone(),
@@ -643,19 +663,14 @@ impl JjPanel {
             .gap_2()
             .items_center()
             .cursor_pointer()
-            .when(is_drag_target, |el| {
-                // Give drag targets a crisp accent background so it's obvious
-                // where the drop will land.
-                el.bg(cx.theme().colors().drop_target_background)
-            })
-            .when(is_selected && !is_drag_target, |el| {
+            .when(is_selected, |el| {
                 el.bg(if is_focused {
                     cx.theme().colors().element_selected
                 } else {
                     cx.theme().colors().element_hover
                 })
             })
-            .when(!is_selected && !is_drag_target, |el| {
+            .when(!is_selected, |el| {
                 el.hover(|el| el.bg(cx.theme().colors().element_hover.opacity(0.5)))
             })
             .child(graph_cell)
@@ -795,20 +810,25 @@ impl JjPanel {
                 })
             })
             // ─── Drop zone: receive a dragged revision (rebase) ────────
+            //
+            // `rebase -s X -d <this row>` makes X a child of this row. In log
+            // order (newest at top), X will land just ABOVE here — so instead
+            // of a full-row tint, draw a 2px line at the top edge. Same pattern
+            // as the tab bar's insert-between indicator.
             .drag_over::<DraggedJjRevision>({
                 let target = target_change.clone();
                 move |el, dragged: &DraggedJjRevision, _, cx| {
-                    // Don't highlight when dragging over ourselves.
                     if dragged.change_id == target {
                         el
                     } else {
                         el.bg(cx.theme().colors().drop_target_background)
+                            .border_color(cx.theme().colors().drop_target_border)
+                            .border_t_2()
                     }
                 }
             })
             .on_drop(cx.listener(
                 move |this, dragged: &DraggedJjRevision, _, cx| {
-                    this.drag_target_ix = None;
                     let source = dragged.change_id.clone();
                     let dest = target_change_for_rev.clone();
                     // `-s`: subtree moves with the commit. `-r` (extract just
@@ -817,6 +837,9 @@ impl JjPanel {
                 },
             ))
             // ─── Drop zone: receive a dragged bookmark (move) ──────────
+            //
+            // Bookmarks attach TO a commit, not between two — full-row tint
+            // is the correct affordance here.
             .drag_over::<DraggedJjBookmark>({
                 let target = target_change;
                 move |el, dragged: &DraggedJjBookmark, _, cx| {
@@ -829,21 +852,27 @@ impl JjPanel {
             })
             .on_drop(cx.listener(
                 move |this, dragged: &DraggedJjBookmark, _, cx| {
-                    this.drag_target_ix = None;
                     let name = dragged.name.clone();
                     let to = target_change_for_bm.clone();
                     this.move_bookmark(name, to, cx);
                 },
             ))
             // ─── Mouse handling ────────────────────────────────────────
-            .on_click(cx.listener(move |this, event: &ClickEvent, _, cx| {
+            .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
                 if event.is_right_click() {
                     return;
                 }
                 this.selected_ix = Some(ix);
-                if event.click_count() == 2 {
-                    // Double-click → jj edit (like GG and jjui).
-                    this.edit(target_change_for_click.clone(), cx);
+                match event.click_count() {
+                    2 => {
+                        // Double-click → jj edit (like GG and jjui).
+                        this.edit(target_change_for_click.clone(), cx);
+                    }
+                    1 => {
+                        // Single click → open Zed's commit inspector.
+                        this.open_commit_view(&commit_id_for_view, window, cx);
+                    }
+                    _ => {}
                 }
                 cx.notify();
             }))
