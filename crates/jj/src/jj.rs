@@ -587,10 +587,7 @@ fn log_sync(workspace_root: &Path, revset_str: &str) -> Result<Vec<JjLogEntry>> 
             has_conflict: commit.has_conflict(),
             is_empty: commit.is_empty(session.repo.as_ref())?,
             bookmarks: bookmark_index.get(&commit_id).cloned().unwrap_or_default(),
-            workspaces: workspace_index
-                .get(&commit_id)
-                .cloned()
-                .unwrap_or_default(),
+            workspaces: workspace_index.get(&commit_id).cloned().unwrap_or_default(),
             parent_ids: commit.parent_ids().iter().map(|p| p.hex().into()).collect(),
         };
 
@@ -707,12 +704,7 @@ fn layout_graph(rows: Vec<(JjRevision, Vec<GraphEdgeInput>)>) -> Vec<JjLogEntry>
         let incoming_lanes: Vec<usize> = lanes
             .iter()
             .enumerate()
-            .filter_map(|(i, waiting)| {
-                waiting
-                    .as_ref()
-                    .filter(|w| **w == rev.commit_id)
-                    .map(|_| i)
-            })
+            .filter_map(|(i, waiting)| waiting.as_ref().filter(|w| **w == rev.commit_id).map(|_| i))
             .collect();
 
         // Lanes that are active right now but NOT arriving here pass straight

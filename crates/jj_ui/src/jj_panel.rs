@@ -1,12 +1,13 @@
 use anyhow::{Context as _, Result};
 use collections::HashMap;
+use editor::Editor;
+use git_ui::commit_view::CommitView;
 use gpui::{
     Action, App, AppContext as _, AsyncWindowContext, Bounds, ClickEvent, Corner, DismissEvent,
     Entity, EventEmitter, FocusHandle, Focusable, Hsla, MouseButton, MouseDownEvent, PathBuilder,
     Pixels, Point, SharedString, Subscription, Task, UniformListScrollHandle, WeakEntity, Window,
     anchored, canvas, deferred, div, point, px, uniform_list,
 };
-use git_ui::commit_view::CommitView;
 use jj::{JjBookmark, JjGraphEdge, JjLogEntry, JjRepository};
 use project::{Project, Worktree};
 use settings::Settings;
@@ -36,6 +37,14 @@ const ROW_HEIGHT: Pixels = px(24.0);
 const DEFAULT_PANEL_WIDTH: Pixels = px(360.0);
 
 const JJ_PANEL_KEY: &str = "JjPanel";
+
+/// State for inline description editing.
+struct EditingDescription {
+    /// Change ID of the commit being described.
+    change_id: SharedString,
+    /// Single-line editor entity for text input.
+    editor: Entity<Editor>,
+}
 
 // ─── Drag payloads ──────────────────────────────────────────────────────────
 
@@ -154,6 +163,9 @@ pub struct JjPanel {
 
     selected_ix: Option<usize>,
 
+    /// When Some, we're inline-editing a commit description.
+    editing_description: Option<EditingDescription>,
+
     context_menu: Option<(Entity<ContextMenu>, Point<Pixels>, Subscription)>,
 
     scroll_handle: UniformListScrollHandle,
@@ -211,6 +223,7 @@ impl JjPanel {
                 state: PanelState::NotAJjRepo,
                 revset: String::new(),
                 selected_ix: None,
+                editing_description: None,
                 context_menu: None,
                 scroll_handle: UniformListScrollHandle::new(),
                 width: None,
@@ -230,14 +243,14 @@ impl JjPanel {
 
     /// Walk project worktrees looking for a `.jj/` root. We take the first match.
     fn discover_repository(&mut self, cx: &mut Context<Self>) {
-        let new_repo = self
-            .project
-            .read(cx)
-            .visible_worktrees(cx)
-            .find_map(|worktree: Entity<Worktree>| {
-                let abs_path = worktree.read(cx).abs_path();
-                JjRepository::discover(&abs_path)
-            });
+        let new_repo =
+            self.project
+                .read(cx)
+                .visible_worktrees(cx)
+                .find_map(|worktree: Entity<Worktree>| {
+                    let abs_path = worktree.read(cx).abs_path();
+                    JjRepository::discover(&abs_path)
+                });
 
         let changed = match (&self.repository, &new_repo) {
             (None, None) => false,
@@ -292,14 +305,13 @@ impl JjPanel {
 
                 if current_mtime != last_mtime {
                     last_mtime = current_mtime;
-                    let ok = this
-                        .update(cx, |this, cx| {
-                            // Skip if a mutation is already in flight — it will
-                            // trigger its own refresh when it completes.
-                            if this.pending_mutation.is_none() {
-                                this.refresh(cx);
-                            }
-                        });
+                    let ok = this.update(cx, |this, cx| {
+                        // Skip if a mutation is already in flight — it will
+                        // trigger its own refresh when it completes.
+                        if this.pending_mutation.is_none() {
+                            this.refresh(cx);
+                        }
+                    });
                     if ok.is_err() {
                         // Entity dropped — stop polling.
                         break;
@@ -354,8 +366,7 @@ impl JjPanel {
                             .enumerate()
                             .map(|(i, e)| (e.revision.change_id.clone(), i))
                             .collect();
-                        this.selected_ix =
-                            prev_change.and_then(|c| change_index.get(&c).copied());
+                        this.selected_ix = prev_change.and_then(|c| change_index.get(&c).copied());
 
                         let max_lanes = jj::max_lanes(&entries);
                         this.state = PanelState::Loaded {
@@ -402,20 +413,18 @@ impl JjPanel {
                 .await
                 .with_context(|| description);
 
-            this.update(cx, |this, cx| {
-                match result {
-                    Ok(()) => {
-                        this.refresh(cx);
-                    }
-                    Err(err) => {
-                        log::error!("jj mutation '{description}' failed: {err:#}");
-                        workspace
-                            .update(cx, |workspace, cx| {
-                                workspace.show_error(&err, cx);
-                            })
-                            .ok();
-                        this.refresh(cx);
-                    }
+            this.update(cx, |this, cx| match result {
+                Ok(()) => {
+                    this.refresh(cx);
+                }
+                Err(err) => {
+                    log::error!("jj mutation '{description}' failed: {err:#}");
+                    workspace
+                        .update(cx, |workspace, cx| {
+                            workspace.show_error(&err, cx);
+                        })
+                        .ok();
+                    this.refresh(cx);
                 }
             })
             .ok();
@@ -484,6 +493,52 @@ impl JjPanel {
         self.run_mutation("undo", |repo| async move { repo.undo().await }, cx);
     }
 
+    fn describe(&mut self, change: SharedString, message: String, cx: &mut Context<Self>) {
+        self.editing_description = None;
+        self.run_mutation(
+            "describe",
+            move |repo| async move { repo.describe_revision(&change, &message).await },
+            cx,
+        );
+    }
+
+    /// Start inline editing of a commit's description.
+    fn start_describe(
+        &mut self,
+        change_id: SharedString,
+        current_desc: SharedString,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let editor = cx.new(|cx| {
+            let mut ed = Editor::single_line(window, cx);
+            ed.set_placeholder_text("Enter commit description…", window, cx);
+            if !current_desc.is_empty() {
+                ed.set_text(current_desc.to_string(), window, cx);
+            }
+            ed
+        });
+        // Focus the editor so the user can type immediately.
+        editor.focus_handle(cx).focus(window);
+        self.editing_description = Some(EditingDescription { change_id, editor });
+        cx.notify();
+    }
+
+    /// Submit the current description editor contents.
+    fn submit_describe(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        let Some(ed) = self.editing_description.take() else {
+            return;
+        };
+        let message = ed.editor.read(cx).text(cx).to_string();
+        self.describe(ed.change_id, message, cx);
+    }
+
+    /// Cancel inline editing without saving.
+    fn cancel_describe(&mut self, cx: &mut Context<Self>) {
+        self.editing_description = None;
+        cx.notify();
+    }
+
     /// Open Zed's built-in commit inspector for the given git commit SHA.
     ///
     /// This reuses `git_ui::CommitView`, which needs a git `Repository` entity.
@@ -528,6 +583,8 @@ impl JjPanel {
 
         let this = cx.entity();
 
+        let description_for_menu = entry.revision.description.clone();
+
         let context_menu = ContextMenu::build(window, cx, |menu, _, _| {
             menu.context(self.focus_handle.clone())
                 .entry("New Child", None, {
@@ -543,6 +600,18 @@ impl JjPanel {
                         let change = change_id.clone();
                         move |_, cx| {
                             this.update(cx, |this, cx| this.edit(change.clone(), cx));
+                        }
+                    })
+                })
+                .when(!is_immutable, |menu| {
+                    menu.entry("Describe", None, {
+                        let this = this.clone();
+                        let change = change_id.clone();
+                        let desc = description_for_menu.clone();
+                        move |window, cx| {
+                            this.update(cx, |this, cx| {
+                                this.start_describe(change.clone(), desc.clone(), window, cx)
+                            });
                         }
                     })
                 })
@@ -654,6 +723,7 @@ impl JjPanel {
         let has_conflict = rev.has_conflict;
         let is_immutable = rev.is_immutable;
         let is_empty = rev.is_empty;
+        let is_wc = rev.is_working_copy;
 
         h_flex()
             .id(id)
@@ -674,9 +744,28 @@ impl JjPanel {
                 el.hover(|el| el.bg(cx.theme().colors().element_hover.opacity(0.5)))
             })
             .child(graph_cell)
+            // ─── Working-copy "@ editing" chip ───────────────────────
+            // Always shown on the `@` row so the user can see at a glance
+            // which commit they're editing. Uses the accent/success color.
+            .when(is_wc, |el| {
+                el.child(
+                    h_flex()
+                        .gap_0p5()
+                        .items_center()
+                        .px_1()
+                        .rounded_sm()
+                        .bg(cx.theme().status().success_background)
+                        .border_1()
+                        .border_color(cx.theme().status().success_border)
+                        .child(
+                            Label::new("@")
+                                .size(LabelSize::XSmall)
+                                .color(Color::Success),
+                        ),
+                )
+            })
             // ─── Workspace markers ───────────────────────────────────
-            // Rendered as `@name` chips. With a single workspace `default` this
-            // is redundant with the filled-circle node, so we skip that case.
+            // Rendered as `@name` chips for non-default workspaces.
             .children(
                 workspaces
                     .into_iter()
@@ -756,15 +845,12 @@ impl JjPanel {
             }))
             // ─── Description (main content, truncated) ─────────────────
             .child(
-                div()
-                    .flex_1()
-                    .overflow_hidden()
-                    .child(
-                        Label::new(description)
-                            .size(LabelSize::Small)
-                            .color(description_color)
-                            .single_line(),
-                    ),
+                div().flex_1().overflow_hidden().child(
+                    Label::new(description)
+                        .size(LabelSize::Small)
+                        .color(description_color)
+                        .single_line(),
+                ),
             )
             // ─── Flags & metadata ──────────────────────────────────────
             .when(has_conflict, |el| {
@@ -827,15 +913,15 @@ impl JjPanel {
                     }
                 }
             })
-            .on_drop(cx.listener(
-                move |this, dragged: &DraggedJjRevision, _, cx| {
+            .on_drop(
+                cx.listener(move |this, dragged: &DraggedJjRevision, _, cx| {
                     let source = dragged.change_id.clone();
                     let dest = target_change_for_rev.clone();
                     // `-s`: subtree moves with the commit. `-r` (extract just
                     // this one) is the oddball case, reachable from the menu.
                     this.rebase_branch(source, dest, cx);
-                },
-            ))
+                }),
+            )
             // ─── Drop zone: receive a dragged bookmark (move) ──────────
             //
             // Bookmarks attach TO a commit, not between two — full-row tint
@@ -850,13 +936,13 @@ impl JjPanel {
                     }
                 }
             })
-            .on_drop(cx.listener(
-                move |this, dragged: &DraggedJjBookmark, _, cx| {
+            .on_drop(
+                cx.listener(move |this, dragged: &DraggedJjBookmark, _, cx| {
                     let name = dragged.name.clone();
                     let to = target_change_for_bm.clone();
                     this.move_bookmark(name, to, cx);
-                },
-            ))
+                }),
+            )
             // ─── Mouse handling ────────────────────────────────────────
             .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
                 if event.is_right_click() {
@@ -1049,11 +1135,7 @@ impl JjPanel {
             .child(Label::new(repo_name).size(LabelSize::Small))
             .child(div().flex_1())
             .when(busy, |el| {
-                el.child(
-                    Label::new("…")
-                        .size(LabelSize::XSmall)
-                        .color(Color::Muted),
-                )
+                el.child(Label::new("…").size(LabelSize::XSmall).color(Color::Muted))
             })
             .child(
                 IconButton::new("jj-undo", IconName::Undo)
@@ -1236,6 +1318,43 @@ impl Render for JjPanel {
             }
         };
 
+        // ─── Inline description editor ────────────────────────────────
+        // Shown between header and log when the user is editing a commit
+        // description. Enter submits, Escape cancels.
+        let describe_bar = self.editing_description.as_ref().map(|ed| {
+            let change_id = ed.change_id.clone();
+            let editor = ed.editor.clone();
+            h_flex()
+                .w_full()
+                .px_2()
+                .py_1()
+                .gap_1()
+                .items_center()
+                .border_b_1()
+                .border_color(cx.theme().colors().border)
+                .bg(cx.theme().colors().editor_background)
+                .child(
+                    Label::new(format!("Describe {}", change_id))
+                        .size(LabelSize::XSmall)
+                        .color(Color::Muted),
+                )
+                .child(div().flex_1().child(editor))
+                .child(
+                    IconButton::new("jj-describe-submit", IconName::Check)
+                        .icon_size(IconSize::Small)
+                        .tooltip(Tooltip::text("Submit (Enter)"))
+                        .on_click(
+                            cx.listener(|this, _, window, cx| this.submit_describe(window, cx)),
+                        ),
+                )
+                .child(
+                    IconButton::new("jj-describe-cancel", IconName::Close)
+                        .icon_size(IconSize::Small)
+                        .tooltip(Tooltip::text("Cancel (Esc)"))
+                        .on_click(cx.listener(|this, _, _, cx| this.cancel_describe(cx))),
+                )
+        });
+
         v_flex()
             .id("jj-panel")
             .key_context("JjPanel")
@@ -1244,6 +1363,7 @@ impl Render for JjPanel {
             .bg(panel_bg)
             .on_action(cx.listener(|this, _: &Refresh, _, cx| this.refresh(cx)))
             .child(header)
+            .children(describe_bar)
             .child(body)
             .children(self.context_menu.as_ref().map(|(menu, position, _)| {
                 deferred(
