@@ -652,11 +652,15 @@ impl JjPanel {
                     .color(Color::Muted),
             )
             .child(div().w_1())
-            .tooltip(Tooltip::text(if author.is_empty() {
-                format!("{target_change}")
-            } else {
-                format!("{target_change} · {author}")
-            }))
+            // Suppress the hover tooltip while the context menu is open — otherwise
+            // it renders on top of the menu and obscures the top entries.
+            .when(self.context_menu.is_none(), |el| {
+                el.tooltip(Tooltip::text(if author.is_empty() {
+                    format!("{target_change}")
+                } else {
+                    format!("{target_change} · {author}")
+                }))
+            })
             // ─── Drag source: pick up a revision to rebase ─────────────
             .when(!is_immutable, |el| {
                 let drag_payload = drag_payload.clone();
