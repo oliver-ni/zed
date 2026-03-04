@@ -4,9 +4,9 @@ use editor::Editor;
 use git_ui::commit_view::CommitView;
 use gpui::{
     Action, App, AppContext as _, AsyncWindowContext, Bounds, ClickEvent, Corner, DismissEvent,
-    DragMoveEvent, Entity, EventEmitter, FocusHandle, Focusable, Hsla, MouseButton, MouseDownEvent,
-    PathBuilder, Pixels, Point, SharedString, Subscription, Task, UniformListScrollHandle,
-    WeakEntity, Window, anchored, canvas, deferred, div, point, px, uniform_list,
+    Entity, EventEmitter, FocusHandle, Focusable, Hsla, MouseButton, MouseDownEvent, PathBuilder,
+    Pixels, Point, SharedString, Subscription, Task, UniformListScrollHandle, WeakEntity, Window,
+    anchored, canvas, deferred, div, point, px, uniform_list,
 };
 use jj::{JjBookmark, JjGraphEdge, JjLogEntry, JjRepository, speculative_rebase};
 use project::{Project, Worktree};
@@ -44,18 +44,6 @@ struct EditingDescription {
     change_id: SharedString,
     /// Single-line editor entity for text input.
     editor: Entity<Editor>,
-}
-
-/// Cached speculative graph preview shown during a revision drag.
-struct DragPreview {
-    /// Change ID of the commit being dragged.
-    source_change: SharedString,
-    /// Change ID of the row currently hovered over.
-    target_change: SharedString,
-    /// Speculatively rebased entries.
-    entries: Arc<[JjLogEntry]>,
-    /// Max lanes in the preview layout.
-    max_lanes: usize,
 }
 
 // ─── Drag payloads ──────────────────────────────────────────────────────────
@@ -178,9 +166,6 @@ pub struct JjPanel {
     /// When Some, we're inline-editing a commit description.
     editing_description: Option<EditingDescription>,
 
-    /// Live graph preview while dragging a revision over a drop target.
-    drag_preview: Option<DragPreview>,
-
     context_menu: Option<(Entity<ContextMenu>, Point<Pixels>, Subscription)>,
 
     scroll_handle: UniformListScrollHandle,
@@ -239,7 +224,6 @@ impl JjPanel {
                 revset: String::new(),
                 selected_ix: None,
                 editing_description: None,
-                drag_preview: None,
                 context_menu: None,
                 scroll_handle: UniformListScrollHandle::new(),
                 width: None,
@@ -452,20 +436,22 @@ impl JjPanel {
     /// Rebase `source` and its descendants onto `dest` (`jj rebase -s`).
     /// This is the default drag-drop behavior — the subtree travels together.
     ///
-    /// Applies an optimistic update: the speculative preview layout (if cached
-    /// from the drag) becomes the visible state immediately, so the user sees
-    /// the graph rearrange on drop without waiting for the CLI round-trip.
+    /// Applies an optimistic update: computes speculative layout at drop time
+    /// and immediately sets it as the visible state, so the user sees the graph
+    /// rearrange on drop without waiting for the CLI round-trip.
     fn rebase_branch(&mut self, source: SharedString, dest: SharedString, cx: &mut Context<Self>) {
         if source == dest {
             return;
         }
 
-        // Optimistic update: use the drag preview as the new state immediately.
-        if let Some(preview) = self.drag_preview.take() {
-            if preview.source_change == source && preview.target_change == dest {
+        // Optimistic update: compute the speculative layout and apply it
+        // immediately so the user sees instant feedback.
+        if let PanelState::Loaded { entries, .. } = &self.state {
+            if let Some((preview_entries, max_lanes)) = speculative_rebase(entries, &source, &dest)
+            {
                 self.state = PanelState::Loaded {
-                    entries: preview.entries,
-                    max_lanes: preview.max_lanes,
+                    entries: preview_entries.into(),
+                    max_lanes,
                 };
                 cx.notify();
             }
@@ -476,56 +462,6 @@ impl JjPanel {
             move |repo| async move { repo.rebase_branch(&source, &dest).await },
             cx,
         );
-    }
-
-    /// Compute and cache a speculative graph preview for a drag hover.
-    /// Called from `on_drag_move` handlers. Only recomputes if the hover
-    /// target actually changed.
-    fn update_drag_preview(
-        &mut self,
-        source_change: SharedString,
-        target_change: SharedString,
-        cx: &mut Context<Self>,
-    ) {
-        // Skip if already cached for this (source, target) pair.
-        if let Some(ref preview) = self.drag_preview {
-            if preview.source_change == source_change && preview.target_change == target_change {
-                return;
-            }
-        }
-
-        if source_change == target_change {
-            self.drag_preview = None;
-            cx.notify();
-            return;
-        }
-
-        let entries = match &self.state {
-            PanelState::Loaded { entries, .. } => entries.clone(),
-            _ => return,
-        };
-
-        if let Some((preview_entries, max_lanes)) =
-            speculative_rebase(&entries, &source_change, &target_change)
-        {
-            self.drag_preview = Some(DragPreview {
-                source_change,
-                target_change,
-                entries: preview_entries.into(),
-                max_lanes,
-            });
-        } else {
-            self.drag_preview = None;
-        }
-        cx.notify();
-    }
-
-    /// Clear the drag preview (e.g. when drag ends without drop).
-    fn clear_drag_preview(&mut self, cx: &mut Context<Self>) {
-        if self.drag_preview.is_some() {
-            self.drag_preview = None;
-            cx.notify();
-        }
     }
 
     fn move_bookmark(&mut self, name: SharedString, to: SharedString, cx: &mut Context<Self>) {
@@ -1373,14 +1309,8 @@ impl Render for JjPanel {
             PanelState::Loaded {
                 entries, max_lanes, ..
             } => {
-                // When a drag preview is active, render the speculative layout
-                // instead of the real one so the user sees the graph rearrange
-                // in real time while dragging.
-                let (entries, max_lanes) = if let Some(ref preview) = self.drag_preview {
-                    (preview.entries.clone(), preview.max_lanes)
-                } else {
-                    (entries.clone(), *max_lanes)
-                };
+                let entries = entries.clone();
+                let max_lanes = *max_lanes;
                 let count = entries.len();
                 let graph_width =
                     GRAPH_LEFT_PAD + LANE_WIDTH * max_lanes.max(1) as f32 + GRAPH_RIGHT_PAD;
@@ -1403,39 +1333,6 @@ impl Render for JjPanel {
                 )
                 .track_scroll(&self.scroll_handle)
                 .size_full()
-                // Track drag-move events on the list container to update the
-                // speculative preview as the user hovers over different rows.
-                .on_drag_move(cx.listener(
-                    |this, event: &DragMoveEvent<DraggedJjRevision>, _, cx| {
-                        let source = event.drag(cx).change_id.clone();
-                        // Determine which row is being hovered based on mouse Y
-                        // position relative to list bounds and ROW_HEIGHT.
-                        let mouse_y = event.event.position.y;
-                        let list_top = event.bounds.origin.y;
-                        let row_ix = ((mouse_y - list_top) / ROW_HEIGHT).floor() as usize;
-
-                        // Look up the change_id at that row index from the
-                        // current real state (not the preview).
-                        let target = match &this.state {
-                            PanelState::Loaded { entries, .. } => {
-                                entries.get(row_ix).map(|e| e.revision.change_id.clone())
-                            }
-                            _ => None,
-                        };
-
-                        if let Some(target) = target {
-                            this.update_drag_preview(source, target, cx);
-                        }
-                    },
-                ))
-                // Clear the preview when the drag leaves the list or ends
-                // without a drop.
-                .on_mouse_up(
-                    MouseButton::Left,
-                    cx.listener(|this, _, _, cx| {
-                        this.clear_drag_preview(cx);
-                    }),
-                )
                 .into_any_element()
             }
         };
