@@ -13,9 +13,12 @@ path = "src/jj.rs"
 
 [dependencies]
 anyhow.workspace = true
+chrono.workspace = true
 collections.workspace = true
 futures.workspace = true
 gpui.workspace = true
+jj-cli = "0.38.0"
+jj-lib = "0.38.0"
 log.workspace = true
 smol.workspace = true
 util.workspace = true

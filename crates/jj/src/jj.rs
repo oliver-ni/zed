@@ -1,25 +1,54 @@
 //! Jujutsu (jj) VCS backend.
 //!
-//! Shells out to the `jj` CLI using structured template output.
-//! Computes a lane-based graph layout suitable for rendering in a commit graph view.
+//! **Reads** (log graph, metadata) go through `jj-lib` directly:
+//! [`Workspace::load`] → revset eval → [`TopoGroupedGraphIterator`]. This
+//! gives us `GraphEdgeType::{Direct, Indirect, Missing}` as ground truth
+//! (the CLI template can't distinguish a direct parent from an ancestor
+//! reached through commits elided by the revset), plus topological grouping
+//! that keeps branches visually bunched.
+//!
+//! **Writes** (rebase, bookmark move, abandon, …) still shell out to the
+//! `jj` CLI. Porting those to `jj-lib` requires the full transaction
+//! machinery — `snapshot_working_copy` (tokio-async FS walk), colocated
+//! `git::import_head`/`export_refs`, `workspace.check_out` — roughly 400
+//! lines of subtle state handling where a bug means the user loses
+//! uncommitted edits. The CLI does this correctly already; subprocess
+//! overhead on a user-gesture mutation is ~5ms.
+//!
+//! Caveat: `jj-lib` pins the on-disk op-log format. If the user's `jj` CLI
+//! is upgraded to an incompatible version, reads here will fail until Zed
+//! is rebuilt against the matching `jj-lib`.
 
-use anyhow::{Context as _, Result, bail};
+use anyhow::{Context as _, Result, anyhow, bail};
 use collections::HashMap;
 use gpui::SharedString;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
+use jj_cli::{
+    cli_util::default_ignored_remote_name,
+    config::{ConfigEnv, config_from_environment, default_config_layers},
+    revset_util,
+    ui::Ui,
+};
+use jj_lib::{
+    backend::CommitId,
+    config::ConfigNamePathBuf,
+    graph::{GraphEdgeType, TopoGroupedGraphIterator},
+    object_id::ObjectId as _,
+    op_heads_store,
+    operation::Operation,
+    repo::{ReadonlyRepo, Repo, RepoLoaderError, StoreFactories},
+    repo_path::RepoPathUiConverter,
+    revset::{
+        self, Revset, RevsetAliasesMap, RevsetDiagnostics, RevsetExtensions, RevsetParseContext,
+        RevsetWorkspaceContext, SymbolResolver, SymbolResolverExtension,
+    },
+    settings::UserSettings,
+    workspace::{self, DefaultWorkspaceLoaderFactory, Workspace, WorkspaceLoaderFactory},
+};
+
 use util::command::new_command;
-
-/// ASCII Unit Separator — delimits fields within a record.
-const FS: char = '\x1f';
-/// ASCII Record Separator — delimits records.
-const RS: char = '\x1e';
-
-/// The `jj log` template. Each record is terminated by RS+newline; fields are
-/// separated by FS. Field order matches [`JjRevision`] parsing.
-///
-/// We use full-length commit IDs for parent references so that edges resolve
-/// unambiguously even in very large repos, but display short prefixes.
-const LOG_TEMPLATE: &str = r#"change_id.shortest(12) ++ "\x1f" ++ commit_id ++ "\x1f" ++ commit_id.shortest(12) ++ "\x1f" ++ description.first_line() ++ "\x1f" ++ author.name() ++ "\x1f" ++ author.email() ++ "\x1f" ++ author.timestamp().format("%s") ++ "\x1f" ++ if(current_working_copy, "1", "0") ++ "\x1f" ++ if(immutable, "1", "0") ++ "\x1f" ++ if(conflict, "1", "0") ++ "\x1f" ++ if(empty, "1", "0") ++ "\x1f" ++ bookmarks.join(",") ++ "\x1f" ++ parents.map(|p| p.commit_id()).join(",") ++ "\x1e\n""#;
 
 /// A single revision in the jj log.
 #[derive(Debug, Clone)]
@@ -75,25 +104,26 @@ pub struct JjLogEntry {
 /// A connection from a commit node to one of its parents.
 ///
 /// `from_lane` is the lane of the child (this row); `to_lane` is where the
-/// edge travels to for the *next* row. If the parent is not in the query
-/// result set, the edge is marked `indirect` and the line should be drawn
-/// dashed / terminated early.
+/// edge travels to for the *next* row. If the edge is `indirect`, there are
+/// elided commits between child and target — draw it dashed. If the target
+/// is outside the query result entirely (`GraphEdgeType::Missing`), the edge
+/// trails off.
 #[derive(Debug, Clone)]
 pub struct JjGraphEdge {
     pub from_lane: usize,
     pub to_lane: usize,
-    /// Full commit ID of the parent this edge points to.
+    /// Full commit ID of the target.
     pub to_commit: SharedString,
-    /// True if the parent is outside the current revset (edge goes "off the
-    /// bottom" of what we're showing).
+    /// True if there are elided commits between here and the target, or the
+    /// target is missing from the revset entirely.
     pub indirect: bool,
 }
 
-/// A handle for running `jj` commands against a specific workspace.
+/// A handle for running jj operations against a specific workspace.
 ///
-/// This is deliberately stateless — each operation re-reads from disk. The
-/// `jj` CLI is fast enough that this is fine for a panel that refreshes on
-/// file events, and it means we never display stale operation-log state.
+/// Stateless — each operation loads the workspace fresh. This means we never
+/// display stale operation-log state even if the user runs `jj` in a terminal
+/// alongside us, at the cost of ~5-10ms per refresh on a typical repo.
 #[derive(Debug, Clone)]
 pub struct JjRepository {
     workspace_root: PathBuf,
@@ -119,55 +149,40 @@ impl JjRepository {
         &self.workspace_root
     }
 
-    /// Run `jj log` with the given revset and return laid-out graph rows.
+    /// Evaluate `revset` against the repository and return laid-out graph rows.
     ///
-    /// The default revset `::` includes all reachable commits. For large repos
-    /// you probably want something narrower like `::@ | trunk()` or the user's
-    /// configured default revset.
+    /// Uses jj-lib's [`TopoGroupedGraphIterator`], which keeps related
+    /// branches grouped in the output order (so they don't interleave) and
+    /// returns [`GraphEdge`]s with accurate direct/indirect/missing
+    /// classification — something the CLI template can't express.
     pub async fn log(&self, revset: &str) -> Result<Vec<JjLogEntry>> {
-        let output = new_command("jj")
-            .current_dir(&self.workspace_root)
-            .args(["--no-pager", "--color=never", "log", "--no-graph", "-r"])
-            .arg(revset)
-            .arg("-T")
-            .arg(LOG_TEMPLATE)
-            .output()
-            .await
-            .context("running jj log")?;
-
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            bail!("jj log failed: {}", stderr.trim());
-        }
-
-        let stdout = String::from_utf8(output.stdout)
-            .context("jj log output was not valid UTF-8")?;
-
-        let revisions = parse_log_output(&stdout)?;
-        Ok(layout_graph(revisions))
+        let root = self.workspace_root.clone();
+        let revset = revset.to_string();
+        smol::unblock(move || log_sync(&root, &revset)).await
     }
 
-    /// Get the user's configured default revset for `jj log`. Falls back to a
-    /// reasonable default if the config lookup fails.
+    /// Read `revsets.log` from the user's jj config. Falls back to jj's
+    /// compiled-in default on any error.
     pub async fn default_revset(&self) -> String {
-        let output = new_command("jj")
-            .current_dir(&self.workspace_root)
-            .args(["--no-pager", "config", "get", "revsets.log"])
-            .output()
-            .await;
-
-        match output {
-            Ok(out) if out.status.success() => {
-                let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
-                if s.is_empty() {
-                    "present(@) | ancestors(immutable_heads().., 2) | trunk()".to_string()
-                } else {
-                    s
-                }
-            }
-            _ => "present(@) | ancestors(immutable_heads().., 2) | trunk()".to_string(),
-        }
+        let root = self.workspace_root.clone();
+        smol::unblock(move || {
+            read_config(&root)
+                .ok()
+                .and_then(|(s, _)| s.get_string("revsets.log").ok())
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| {
+                    "present(@) | ancestors(immutable_heads().., 2) | trunk()".to_owned()
+                })
+        })
+        .await
     }
+
+    // --- Mutations (CLI) -----------------------------------------------------
+    //
+    // These stay CLI-backed. The jj-lib transaction path requires
+    // snapshot_working_copy (tokio-async), git import/export for colocated
+    // repos, and workspace.check_out after every mutation. The CLI handles
+    // all of that correctly; a subprocess on user click is fine.
 
     /// `jj rebase -r <source> -d <destination>`
     ///
@@ -242,78 +257,319 @@ impl JjRepository {
     }
 }
 
-fn parse_log_output(stdout: &str) -> Result<Vec<JjRevision>> {
-    let mut revisions = Vec::new();
-    for record in stdout.split(RS) {
-        let record = record.trim_matches('\n');
-        if record.is_empty() {
-            continue;
-        }
-        let fields: Vec<&str> = record.split(FS).collect();
-        if fields.len() != 13 {
-            // Tolerate trailing garbage / partial writes rather than failing
-            // the whole panel.
-            log::warn!("skipping malformed jj log record ({} fields): {:?}", fields.len(), record);
-            continue;
-        }
-        let bookmarks = if fields[11].is_empty() {
-            Vec::new()
-        } else {
-            fields[11]
-                .split(',')
-                .map(|s| SharedString::from(s.to_string()))
-                .collect()
+// --- jj-lib: log query -------------------------------------------------------
+
+/// A loaded jj workspace at its head operation.
+///
+/// Borrows `settings`/`aliases_map`/etc. are threaded through for revset
+/// parsing; `repo` and `wc_id` come from `load_at_head`. Held only for the
+/// duration of one `log_sync` call.
+struct Session {
+    workspace: Workspace,
+    settings: UserSettings,
+    aliases_map: RevsetAliasesMap,
+    extensions: RevsetExtensions,
+    path_converter: RepoPathUiConverter,
+    repo: Arc<ReadonlyRepo>,
+    wc_id: CommitId,
+}
+
+impl Session {
+    fn load(workspace_root: &Path) -> Result<Self> {
+        let (settings, aliases_map) = read_config(workspace_root)?;
+
+        let factory = DefaultWorkspaceLoaderFactory;
+        let loader = factory.create(workspace_root).context("locate workspace")?;
+        let workspace = loader
+            .load(
+                &settings,
+                &StoreFactories::default(),
+                &workspace::default_working_copy_factories(),
+            )
+            .context("load workspace")?;
+
+        let repo = load_at_head(&workspace)?;
+
+        let wc_id = repo
+            .view()
+            .get_wc_commit_id(workspace.workspace_name())
+            .ok_or_else(|| anyhow!("no working-copy commit for this workspace"))?
+            .clone();
+
+        let path_converter = RepoPathUiConverter::Fs {
+            cwd: workspace.workspace_root().to_owned(),
+            base: workspace.workspace_root().to_owned(),
         };
-        let parent_ids = if fields[12].is_empty() {
-            Vec::new()
-        } else {
-            fields[12]
-                .split(',')
-                .map(|s| SharedString::from(s.to_string()))
-                .collect()
-        };
-        revisions.push(JjRevision {
-            change_id: fields[0].to_string().into(),
-            commit_id: fields[1].to_string().into(),
-            short_commit_id: fields[2].to_string().into(),
-            description: fields[3].to_string().into(),
-            author_name: fields[4].to_string().into(),
-            author_email: fields[5].to_string().into(),
-            timestamp: fields[6].parse().unwrap_or(0),
-            is_working_copy: fields[7] == "1",
-            is_immutable: fields[8] == "1",
-            has_conflict: fields[9] == "1",
-            is_empty: fields[10] == "1",
-            bookmarks,
-            parent_ids,
-        });
+
+        Ok(Self {
+            workspace,
+            settings,
+            aliases_map,
+            extensions: RevsetExtensions::default(),
+            path_converter,
+            repo,
+            wc_id,
+        })
     }
-    Ok(revisions)
+
+    /// Parse and evaluate a revset expression against this repo.
+    ///
+    /// The returned [`Revset`] borrows from `self.repo`; the caller must keep
+    /// the [`Session`] alive while iterating.
+    fn evaluate_revset<'a>(&'a self, revset_str: &str) -> Result<Box<dyn Revset + 'a>> {
+        let parse_ctx = self.parse_context();
+        let mut diagnostics = RevsetDiagnostics::new();
+        let expr = revset::parse(&mut diagnostics, revset_str, &parse_ctx)
+            .with_context(|| format!("parse revset `{revset_str}`"))?;
+        let expr = revset::optimize(expr);
+
+        let resolver = SymbolResolver::new(
+            self.repo.as_ref(),
+            &([] as [Box<dyn SymbolResolverExtension>; 0]),
+        );
+        let resolved = expr
+            .resolve_user_expression(self.repo.as_ref(), &resolver)
+            .with_context(|| format!("resolve revset `{revset_str}`"))?;
+
+        resolved
+            .evaluate(self.repo.as_ref())
+            .with_context(|| format!("evaluate revset `{revset_str}`"))
+    }
+
+    /// Build a fast `CommitId → bool` check for `immutable_heads()::`.
+    ///
+    /// Evaluated once per log query; the returned closure is cheap
+    /// (index bitmap lookup).
+    fn immutable_containing_fn<'a>(
+        &'a self,
+    ) -> Result<Box<dyn Fn(&CommitId) -> Result<bool> + 'a>> {
+        let parse_ctx = self.parse_context();
+        let mut diagnostics = RevsetDiagnostics::new();
+        let heads = revset_util::parse_immutable_heads_expression(&mut diagnostics, &parse_ctx)
+            .context("parse immutable_heads()")?;
+        let immutable = heads.ancestors();
+
+        let resolver = SymbolResolver::new(
+            self.repo.as_ref(),
+            &([] as [Box<dyn SymbolResolverExtension>; 0]),
+        );
+        let resolved = immutable
+            .resolve_user_expression(self.repo.as_ref(), &resolver)
+            .context("resolve immutable_heads()::")?;
+        let revset = resolved
+            .evaluate(self.repo.as_ref())
+            .context("evaluate immutable_heads()::")?;
+
+        let contains = revset.containing_fn();
+        Ok(Box::new(move |id| Ok(contains(id)?)))
+    }
+
+    fn parse_context(&self) -> RevsetParseContext<'_> {
+        let ws_ctx = RevsetWorkspaceContext {
+            path_converter: &self.path_converter,
+            workspace_name: self.workspace.workspace_name(),
+        };
+        RevsetParseContext {
+            aliases_map: &self.aliases_map,
+            local_variables: std::collections::HashMap::new(),
+            user_email: self.settings.user_email(),
+            date_pattern_context: chrono::Local::now().into(),
+            default_ignored_remote: default_ignored_remote_name(self.repo.store()),
+            extensions: &self.extensions,
+            workspace: Some(ws_ctx),
+            use_glob_by_default: false,
+        }
+    }
+}
+
+/// Load merged jj config (defaults + user `~/.jjconfig.toml` + repo
+/// `.jj/repo/config.toml`) and pull the revset alias table from it.
+///
+/// The alias table is required for the default revset to parse at all:
+/// `immutable_heads()`, `trunk()`, etc. are all user-configurable aliases,
+/// not builtin functions.
+fn read_config(workspace_root: &Path) -> Result<(UserSettings, RevsetAliasesMap)> {
+    let mut config_env = ConfigEnv::from_environment();
+    let mut raw = config_from_environment(default_config_layers());
+
+    config_env.reload_user_config(&mut raw)?;
+    config_env.reset_repo_path(&workspace_root.join(".jj").join("repo"));
+    // Ignore repo-config load failures (malformed TOML etc.) rather than
+    // killing the whole panel — we'll still have defaults + user config.
+    let _ = config_env.reload_repo_config(&Ui::null(), &mut raw);
+
+    let config = config_env.resolve_config(&raw)?;
+    let aliases_map = build_aliases_map(&config)?;
+    let settings = UserSettings::from_config(config)?;
+
+    Ok((settings, aliases_map))
+}
+
+/// Walk all `[revset-aliases]` tables across the config stack (in priority
+/// order, so later layers override earlier ones) and collect them into a
+/// single [`RevsetAliasesMap`].
+fn build_aliases_map(config: &jj_lib::config::StackedConfig) -> Result<RevsetAliasesMap> {
+    let table_name = ConfigNamePathBuf::from_iter(["revset-aliases"]);
+    let mut map = RevsetAliasesMap::new();
+    for layer in config.layers() {
+        let Ok(Some(table)) = layer.look_up_table(&table_name) else {
+            continue;
+        };
+        for (decl, item) in table.iter() {
+            let Some(value) = item.as_str() else {
+                continue;
+            };
+            map.insert(decl, value)
+                .map_err(|e| anyhow!("revset-aliases.{decl}: {e}"))?;
+        }
+    }
+    Ok(map)
+}
+
+/// Load the repo at whichever operation is current head.
+///
+/// If there are concurrent op-heads (user ran `jj` in two terminals
+/// simultaneously and neither saw the other yet), merge them first. This
+/// is straight from jj-cli's init path.
+fn load_at_head(workspace: &Workspace) -> Result<Arc<ReadonlyRepo>> {
+    let loader = workspace.repo_loader();
+    let op = op_heads_store::resolve_op_heads(
+        loader.op_heads_store().as_ref(),
+        loader.op_store(),
+        |op_heads| {
+            let base_repo = loader.load_at(&op_heads[0])?;
+            let mut tx = base_repo.start_transaction();
+            for other in op_heads.into_iter().skip(1) {
+                tx.merge_operation(other)?;
+                tx.repo_mut().rebase_descendants()?;
+            }
+            Ok::<Operation, RepoLoaderError>(
+                tx.write("resolve concurrent operations")?
+                    .leave_unpublished()
+                    .operation()
+                    .clone(),
+            )
+        },
+    )?;
+    loader.load_at(&op).context("load op head")
+}
+
+/// Synchronous body of [`JjRepository::log`]. Runs inside `smol::unblock`.
+fn log_sync(workspace_root: &Path, revset_str: &str) -> Result<Vec<JjLogEntry>> {
+    let session = Session::load(workspace_root)?;
+
+    let is_immutable = session.immutable_containing_fn()?;
+
+    // CommitId → local bookmark names. Walk `local_bookmarks()` rather than
+    // `bookmarks()` so we skip remote refs — the panel only shows locals.
+    let mut bookmark_index: HashMap<CommitId, Vec<SharedString>> = HashMap::default();
+    for (name, target) in session.repo.view().local_bookmarks() {
+        for id in target.added_ids() {
+            bookmark_index
+                .entry(id.clone())
+                .or_default()
+                .push(SharedString::from(name.as_str().to_owned()));
+        }
+    }
+
+    let revset = session.evaluate_revset(revset_str)?;
+    let root_id = session.repo.store().root_commit_id().clone();
+
+    // The `as_id` closure is jj-lib asking "how do I get a hashable identity
+    // out of your node type"; for us the node IS the id, so identity.
+    let iter = TopoGroupedGraphIterator::new(revset.iter_graph(), |id: &CommitId| id);
+
+    let mut rows: Vec<(JjRevision, Vec<GraphEdgeInput>)> = Vec::new();
+    for item in iter {
+        let (commit_id, graph_edges) = item?;
+        let commit = session.repo.store().get_commit(&commit_id)?;
+        let author = commit.author();
+
+        // Convert the jj-lib graph edges into the decoupled form the layout
+        // pass consumes. `Missing` is how jj-lib says "target isn't in the
+        // revset at all" (typically the root's synthetic parent); `Indirect`
+        // means there are real commits between here and the target that the
+        // revset filtered out.
+        let edges: Vec<GraphEdgeInput> = graph_edges
+            .into_iter()
+            .filter_map(|e| {
+                let missing = e.edge_type == GraphEdgeType::Missing;
+                // Skip the phantom missing-edge to the root's nonexistent parent.
+                if missing && e.target == root_id {
+                    return None;
+                }
+                Some(GraphEdgeInput {
+                    target: e.target.hex().into(),
+                    indirect: e.edge_type != GraphEdgeType::Direct,
+                    missing,
+                })
+            })
+            .collect();
+
+        let change_hex = commit.change_id().reverse_hex();
+        let commit_hex = commit_id.hex();
+
+        let revision = JjRevision {
+            change_id: SharedString::from(change_hex[..change_hex.len().min(12)].to_owned()),
+            commit_id: commit_hex.clone().into(),
+            short_commit_id: SharedString::from(commit_hex[..commit_hex.len().min(12)].to_owned()),
+            description: commit
+                .description()
+                .lines()
+                .next()
+                .unwrap_or_default()
+                .to_owned()
+                .into(),
+            author_name: author.name.clone().into(),
+            author_email: author.email.clone().into(),
+            // jj stores millis since epoch; the panel expects seconds.
+            timestamp: author.timestamp.timestamp.0 / 1000,
+            is_working_copy: commit_id == session.wc_id,
+            is_immutable: is_immutable(&commit_id)?,
+            has_conflict: commit.has_conflict(),
+            is_empty: commit.is_empty(session.repo.as_ref())?,
+            bookmarks: bookmark_index.get(&commit_id).cloned().unwrap_or_default(),
+            parent_ids: commit.parent_ids().iter().map(|p| p.hex().into()).collect(),
+        };
+
+        rows.push((revision, edges));
+    }
+
+    Ok(layout_graph(rows))
+}
+
+// --- Lane layout -------------------------------------------------------------
+
+/// Graph-edge input to the layout pass, decoupled from `jj_lib::graph` types
+/// so tests can build them without constructing real `CommitId`s.
+#[derive(Debug, Clone)]
+struct GraphEdgeInput {
+    /// Hex-encoded commit id of the edge's target.
+    target: SharedString,
+    /// The edge passes through elided commits (dashed line).
+    indirect: bool,
+    /// The target is outside the revset entirely — don't reserve a lane for
+    /// it, just let the edge trail off to a phantom column.
+    missing: bool,
 }
 
 /// Assign each revision to a vertical lane and compute the outgoing edges.
 ///
-/// This is a classic "stem"-based layout: we maintain a list of open lanes,
-/// each waiting for a particular parent commit. When a commit arrives, it
-/// claims the first lane that was waiting for it (terminating any other lanes
-/// waiting for the same commit as merges). Its parents then reserve lanes for
-/// the rows below.
+/// Classic "stem" layout: we maintain a list of open lanes, each waiting for
+/// a particular target commit. When a commit arrives, it claims the leftmost
+/// lane that was waiting for it (other lanes waiting for the same commit
+/// collapse into it — merges). Its own edges then reserve lanes for the rows
+/// below.
 ///
-/// `jj log` already outputs in topological order (children before parents),
-/// which is exactly what this algorithm needs.
-fn layout_graph(revisions: Vec<JjRevision>) -> Vec<JjLogEntry> {
-    // Set of commit IDs present in this log — used to mark edges that point
-    // outside the revset as indirect.
-    let present: collections::HashSet<_> = revisions
-        .iter()
-        .map(|r| r.commit_id.clone())
-        .collect();
-
-    // Each slot holds the commit ID it's waiting for, or None if free.
+/// `TopoGroupedGraphIterator` already hands us rows children-before-parents
+/// with related branches clustered together, which is exactly the order this
+/// algorithm wants.
+fn layout_graph(rows: Vec<(JjRevision, Vec<GraphEdgeInput>)>) -> Vec<JjLogEntry> {
+    // Each slot holds the target commit id it's waiting for, or None if free.
     let mut lanes: Vec<Option<SharedString>> = Vec::new();
-    let mut entries = Vec::with_capacity(revisions.len());
+    let mut entries = Vec::with_capacity(rows.len());
 
-    for rev in revisions {
+    for (rev, input_edges) in rows {
         // Find all lanes waiting for this commit.
         let incoming_lanes: Vec<usize> = lanes
             .iter()
@@ -356,46 +612,41 @@ fn layout_graph(revisions: Vec<JjRevision>) -> Vec<JjLogEntry> {
             }
         };
 
-        // Reserve lanes for parents. First parent stays in our lane; additional
-        // parents (merges) spawn new lanes.
-        let mut edges = Vec::with_capacity(rev.parent_ids.len());
-        for (parent_idx, parent_id) in rev.parent_ids.iter().enumerate() {
-            let indirect = !present.contains(parent_id);
-
-            let to_lane = if parent_idx == 0 {
-                // First parent continues in our lane.
-                if !indirect {
+        // Reserve lanes for outgoing edges. First edge stays in our lane;
+        // additional edges spawn new lanes (or join existing ones waiting for
+        // the same target — shared ancestor).
+        let mut edges = Vec::with_capacity(input_edges.len());
+        for (edge_idx, input) in input_edges.into_iter().enumerate() {
+            let to_lane = if edge_idx == 0 {
+                // First edge continues in our lane. Missing edges don't
+                // reserve — the lane is free below us.
+                if !input.missing {
                     if lanes.len() <= my_lane {
                         lanes.resize(my_lane + 1, None);
                     }
-                    lanes[my_lane] = Some(parent_id.clone());
+                    lanes[my_lane] = Some(input.target.clone());
                 }
                 my_lane
+            } else if input.missing {
+                // Target outside the revset — phantom lane one past the
+                // rightmost real one; don't actually reserve it.
+                lanes.len()
+            } else if let Some(existing) =
+                lanes.iter().position(|w| w.as_ref() == Some(&input.target))
+            {
+                // Another lane is already headed to this same target. Join it
+                // instead of spawning a parallel line that'll merge anyway.
+                existing
             } else {
-                // Merge parent: check if some other lane is already waiting for
-                // this same parent (common ancestor). If so, join it instead of
-                // spawning a duplicate.
-                let existing = lanes
-                    .iter()
-                    .position(|w| w.as_ref() == Some(parent_id));
-                if let Some(existing_lane) = existing {
-                    existing_lane
-                } else if indirect {
-                    // Parent is outside the revset; don't reserve a real lane.
-                    // Point the edge at a phantom lane one past the end for
-                    // rendering purposes.
-                    lanes.len()
-                } else {
-                    // Spawn a new lane.
-                    match lanes.iter().position(Option::is_none) {
-                        Some(i) => {
-                            lanes[i] = Some(parent_id.clone());
-                            i
-                        }
-                        None => {
-                            lanes.push(Some(parent_id.clone()));
-                            lanes.len() - 1
-                        }
+                // Spawn a new lane.
+                match lanes.iter().position(Option::is_none) {
+                    Some(i) => {
+                        lanes[i] = Some(input.target.clone());
+                        i
+                    }
+                    None => {
+                        lanes.push(Some(input.target.clone()));
+                        lanes.len() - 1
                     }
                 }
             };
@@ -403,8 +654,8 @@ fn layout_graph(revisions: Vec<JjRevision>) -> Vec<JjLogEntry> {
             edges.push(JjGraphEdge {
                 from_lane: my_lane,
                 to_lane,
-                to_commit: parent_id.clone(),
-                indirect,
+                to_commit: input.target,
+                indirect: input.indirect,
             });
         }
 
@@ -438,9 +689,7 @@ pub fn build_commit_index(entries: &[JjLogEntry]) -> HashMap<SharedString, usize
 pub fn max_lanes(entries: &[JjLogEntry]) -> usize {
     entries
         .iter()
-        .flat_map(|e| {
-            std::iter::once(e.lane).chain(e.edges.iter().map(|edge| edge.to_lane))
-        })
+        .flat_map(|e| std::iter::once(e.lane).chain(e.edges.iter().map(|edge| edge.to_lane)))
         .max()
         .map(|m| m + 1)
         .unwrap_or(1)
@@ -450,62 +699,7 @@ pub fn max_lanes(entries: &[JjLogEntry]) -> usize {
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_parse_single() {
-        let input = "abc12345\x1ffull_commit_id_here\x1fabc123\x1fhello world\x1fAlice\x1falice@example.com\x1f1234567890\x1f1\x1f0\x1f0\x1f0\x1fmain,dev\x1fparent_full_id\x1e\n";
-        let revs = parse_log_output(input).unwrap();
-        assert_eq!(revs.len(), 1);
-        let r = &revs[0];
-        assert_eq!(r.change_id.as_ref(), "abc12345");
-        assert_eq!(r.description.as_ref(), "hello world");
-        assert!(r.is_working_copy);
-        assert!(!r.is_immutable);
-        assert_eq!(r.bookmarks.len(), 2);
-        assert_eq!(r.parent_ids.len(), 1);
-    }
-
-    #[test]
-    fn test_layout_linear() {
-        // c → b → a (c is newest, a is oldest)
-        let revs = vec![
-            rev("c", vec!["b"]),
-            rev("b", vec!["a"]),
-            rev("a", vec![]),
-        ];
-        let entries = layout_graph(revs);
-        assert_eq!(entries.len(), 3);
-        // All should be in lane 0.
-        for e in &entries {
-            assert_eq!(e.lane, 0);
-        }
-    }
-
-    #[test]
-    fn test_layout_merge() {
-        // Merge: d has two parents b and c, which both descend from a.
-        //   d
-        //  / \
-        // b   c
-        //  \ /
-        //   a
-        let revs = vec![
-            rev("d", vec!["b", "c"]),
-            rev("b", vec!["a"]),
-            rev("c", vec!["a"]),
-            rev("a", vec![]),
-        ];
-        let entries = layout_graph(revs);
-        assert_eq!(entries[0].lane, 0); // d
-        assert_eq!(entries[0].edges.len(), 2);
-        // b should be in lane 0 (first parent of d)
-        assert_eq!(entries[1].lane, 0);
-        // c should be in lane 1 (second parent spawned new lane)
-        assert_eq!(entries[2].lane, 1);
-        // a should merge both back to lane 0
-        assert_eq!(entries[3].lane, 0);
-    }
-
-    fn rev(id: &str, parents: Vec<&str>) -> JjRevision {
+    fn rev(id: &str) -> JjRevision {
         JjRevision {
             change_id: id.to_string().into(),
             commit_id: id.to_string().into(),
@@ -519,7 +713,101 @@ mod tests {
             has_conflict: false,
             is_empty: false,
             bookmarks: vec![],
-            parent_ids: parents.iter().map(|p| p.to_string().into()).collect(),
+            parent_ids: vec![],
         }
+    }
+
+    fn direct(target: &str) -> GraphEdgeInput {
+        GraphEdgeInput {
+            target: target.to_string().into(),
+            indirect: false,
+            missing: false,
+        }
+    }
+
+    #[test]
+    fn test_layout_linear() {
+        // c → b → a (c is newest, a is oldest)
+        let rows = vec![
+            (rev("c"), vec![direct("b")]),
+            (rev("b"), vec![direct("a")]),
+            (rev("a"), vec![]),
+        ];
+        let entries = layout_graph(rows);
+        assert_eq!(entries.len(), 3);
+        for e in &entries {
+            assert_eq!(e.lane, 0);
+        }
+        // a has one incoming lane (from b in lane 0).
+        assert_eq!(entries[2].incoming_lanes, vec![0]);
+    }
+
+    #[test]
+    fn test_layout_merge() {
+        // Merge: d has two parents b and c, which both descend from a.
+        //   d
+        //  / \
+        // b   c
+        //  \ /
+        //   a
+        let rows = vec![
+            (rev("d"), vec![direct("b"), direct("c")]),
+            (rev("b"), vec![direct("a")]),
+            (rev("c"), vec![direct("a")]),
+            (rev("a"), vec![]),
+        ];
+        let entries = layout_graph(rows);
+        assert_eq!(entries[0].lane, 0); // d
+        assert_eq!(entries[0].edges.len(), 2);
+        // b in lane 0 (first edge of d stays in-lane)
+        assert_eq!(entries[1].lane, 0);
+        // c in lane 1 (second edge spawned a new lane)
+        assert_eq!(entries[2].lane, 1);
+        // a merges both back — lands in leftmost incoming lane
+        assert_eq!(entries[3].lane, 0);
+        assert_eq!(entries[3].incoming_lanes, vec![0, 1]);
+    }
+
+    #[test]
+    fn test_layout_indirect_edge() {
+        // c →(indirect) a, with b present but not in c's path.
+        // c's edge to a should be dashed but still reserve lane 0.
+        let rows = vec![
+            (
+                rev("c"),
+                vec![GraphEdgeInput {
+                    target: "a".to_string().into(),
+                    indirect: true,
+                    missing: false,
+                }],
+            ),
+            (rev("a"), vec![]),
+        ];
+        let entries = layout_graph(rows);
+        assert_eq!(entries[0].edges[0].indirect, true);
+        assert_eq!(entries[0].edges[0].to_lane, 0);
+        // a should have received the incoming lane from c
+        assert_eq!(entries[1].incoming_lanes, vec![0]);
+    }
+
+    #[test]
+    fn test_layout_missing_edge_no_lane() {
+        // c → b(missing). Missing edges don't reserve a lane — c is in lane 0
+        // but lane 0 stays free for the next head.
+        let rows = vec![
+            (
+                rev("c"),
+                vec![GraphEdgeInput {
+                    target: "b".to_string().into(),
+                    indirect: true,
+                    missing: true,
+                }],
+            ),
+            (rev("d"), vec![]), // unrelated head should reuse lane 0
+        ];
+        let entries = layout_graph(rows);
+        assert_eq!(entries[0].lane, 0);
+        assert_eq!(entries[1].lane, 0); // d reused lane 0 — missing edge didn't reserve it
+        assert_eq!(entries[1].incoming_lanes, Vec::<usize>::new());
     }
 }
