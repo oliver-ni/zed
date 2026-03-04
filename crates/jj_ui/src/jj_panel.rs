@@ -9,7 +9,7 @@ use gpui::{
 use jj::{JjBookmark, JjGraphEdge, JjLogEntry, JjRepository};
 use project::{Project, Worktree};
 use settings::Settings;
-use std::{ops::Range, sync::Arc};
+use std::{ops::Range, sync::Arc, time::Duration};
 use theme::ThemeSettings;
 use ui::{ContextMenu, Tooltip, prelude::*};
 use workspace::{
@@ -18,6 +18,9 @@ use workspace::{
 };
 
 use crate::{Refresh, ToggleFocus};
+
+/// How often we poll `.jj/repo/op_heads/heads/` for external changes.
+const OP_HEADS_POLL_INTERVAL: Duration = Duration::from_secs(1);
 
 // ─── Layout constants ───────────────────────────────────────────────────────
 // Tuned to match Zed's git_graph density but slightly wider nodes so the
@@ -162,6 +165,10 @@ pub struct JjPanel {
     pending_refresh: Option<Task<()>>,
     pending_mutation: Option<Task<()>>,
 
+    /// Background loop polling `.jj/repo/op_heads/heads/` for external changes.
+    /// Dropped (cancelled) when the repository changes or the panel is dropped.
+    _op_watcher: Option<Task<()>>,
+
     _subscriptions: Vec<Subscription>,
 }
 
@@ -212,11 +219,13 @@ impl JjPanel {
                 refresh_epoch: 0,
                 pending_refresh: None,
                 pending_mutation: None,
+                _op_watcher: None,
                 _subscriptions: subs,
             };
 
             this.discover_repository(cx);
             this.refresh(cx);
+            this.start_op_watcher(cx);
             this
         })
     }
@@ -243,7 +252,63 @@ impl JjPanel {
         if changed {
             self.selected_ix = None;
             self.revset.clear();
+            self.start_op_watcher(cx);
         }
+    }
+
+    /// Spawn a background loop that polls `.jj/repo/op_heads/heads/` for
+    /// changes every [`OP_HEADS_POLL_INTERVAL`]. When the directory's mtime
+    /// changes (a new jj operation was committed — by the user's terminal,
+    /// another tool, or our own mutations), we trigger a panel refresh.
+    ///
+    /// This is the simplest reliable cross-platform approach. Proper
+    /// `inotify`/`kqueue` watching would be more efficient but Zed's fs
+    /// watcher doesn't cover `.jj/` (it's in `.gitignore` for colocated
+    /// repos).
+    fn start_op_watcher(&mut self, cx: &mut Context<Self>) {
+        // Drop the old watcher (cancels the task).
+        self._op_watcher = None;
+
+        let Some(repo) = self.repository.as_ref() else {
+            return;
+        };
+        let op_heads_dir = repo.workspace_root().join(".jj/repo/op_heads/heads");
+
+        self._op_watcher = Some(cx.spawn(async move |this, cx| {
+            let mut last_mtime = cx
+                .background_spawn({
+                    let d = op_heads_dir.clone();
+                    async move { std::fs::metadata(&d).and_then(|m| m.modified()).ok() }
+                })
+                .await;
+
+            loop {
+                cx.background_executor().timer(OP_HEADS_POLL_INTERVAL).await;
+
+                let current_mtime = cx
+                    .background_spawn({
+                        let d = op_heads_dir.clone();
+                        async move { std::fs::metadata(&d).and_then(|m| m.modified()).ok() }
+                    })
+                    .await;
+
+                if current_mtime != last_mtime {
+                    last_mtime = current_mtime;
+                    let ok = this
+                        .update(cx, |this, cx| {
+                            // Skip if a mutation is already in flight — it will
+                            // trigger its own refresh when it completes.
+                            if this.pending_mutation.is_none() {
+                                this.refresh(cx);
+                            }
+                        });
+                    if ok.is_err() {
+                        // Entity dropped — stop polling.
+                        break;
+                    }
+                }
+            }
+        }));
     }
 
     /// Kick off a background `jj log` and swap the result in when it arrives.
