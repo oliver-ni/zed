@@ -519,7 +519,7 @@ impl JjPanel {
             ed
         });
         // Focus the editor so the user can type immediately.
-        editor.focus_handle(cx).focus(window);
+        editor.focus_handle(cx).focus(window, cx);
         self.editing_description = Some(EditingDescription { change_id, editor });
         cx.notify();
     }
