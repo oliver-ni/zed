@@ -801,6 +801,118 @@ fn layout_graph(rows: Vec<(JjRevision, Vec<GraphEdgeInput>)>) -> Vec<JjLogEntry>
     entries
 }
 
+/// Compute a speculative graph layout as if `jj rebase -s <source> -d <dest>`
+/// had been executed. This is a pure function over the existing entries — no
+/// jj-lib or CLI is involved — so it's cheap enough to call on every drag-move
+/// frame (~µs for typical repo sizes).
+///
+/// Returns `None` if source or dest can't be found, or if source is an
+/// ancestor of dest (which would be a no-op or create a cycle).
+pub fn speculative_rebase(
+    entries: &[JjLogEntry],
+    source_change: &str,
+    dest_change: &str,
+) -> Option<(Vec<JjLogEntry>, usize)> {
+    if source_change == dest_change {
+        return None;
+    }
+
+    // Build commit_id → change_id and change_id → commit_id maps.
+    let change_to_commit: HashMap<&str, &str> = entries
+        .iter()
+        .map(|e| (e.revision.change_id.as_ref(), e.revision.commit_id.as_ref()))
+        .collect();
+
+    let source_commit = change_to_commit.get(source_change)?;
+    let dest_commit = change_to_commit.get(dest_change)?;
+
+    // Collect the subtree rooted at source (source + all descendants).
+    // We identify descendants by walking children relationships.
+    let mut children: HashMap<&str, Vec<&str>> = HashMap::default();
+    for entry in entries {
+        for edge in &entry.edges {
+            children
+                .entry(edge.to_commit.as_ref())
+                .or_default()
+                .push(entry.revision.commit_id.as_ref());
+        }
+    }
+
+    let mut subtree: collections::HashSet<&str> = collections::HashSet::default();
+    let mut stack: Vec<&str> = vec![source_commit];
+    while let Some(cid) = stack.pop() {
+        if subtree.insert(cid) {
+            if let Some(kids) = children.get(cid) {
+                stack.extend(kids.iter());
+            }
+        }
+    }
+
+    // Don't allow rebasing onto a descendant (cycle).
+    if subtree.contains(dest_commit) {
+        return None;
+    }
+
+    // Reconstruct (JjRevision, Vec<GraphEdgeInput>) rows with modified parents
+    // for the source commit, then reorder so the subtree appears right after dest.
+    let mut before_dest: Vec<(JjRevision, Vec<GraphEdgeInput>)> = Vec::new();
+    let mut dest_row: Option<(JjRevision, Vec<GraphEdgeInput>)> = None;
+    let mut subtree_rows: Vec<(JjRevision, Vec<GraphEdgeInput>)> = Vec::new();
+    let mut after_dest: Vec<(JjRevision, Vec<GraphEdgeInput>)> = Vec::new();
+
+    let mut seen_dest = false;
+
+    for entry in entries {
+        let is_source = entry.revision.change_id.as_ref() == source_change;
+        let is_dest = entry.revision.change_id.as_ref() == dest_change;
+        let in_subtree = subtree.contains(entry.revision.commit_id.as_ref());
+
+        let edges: Vec<GraphEdgeInput> = if is_source {
+            // Reparent source onto dest.
+            vec![GraphEdgeInput {
+                target: SharedString::from(dest_commit.to_string()),
+                indirect: false,
+                missing: false,
+            }]
+        } else {
+            entry
+                .edges
+                .iter()
+                .map(|e| GraphEdgeInput {
+                    target: e.to_commit.clone(),
+                    indirect: e.indirect,
+                    missing: false,
+                })
+                .collect()
+        };
+
+        let pair = (entry.revision.clone(), edges);
+
+        if is_dest {
+            seen_dest = true;
+            dest_row = Some(pair);
+        } else if in_subtree {
+            subtree_rows.push(pair);
+        } else if seen_dest {
+            after_dest.push(pair);
+        } else {
+            before_dest.push(pair);
+        }
+    }
+
+    // Assemble: before_dest, dest, subtree, after_dest
+    let mut rows = before_dest;
+    if let Some(d) = dest_row {
+        rows.push(d);
+    }
+    rows.extend(subtree_rows);
+    rows.extend(after_dest);
+
+    let result = layout_graph(rows);
+    let max = max_lanes(&result);
+    Some((result, max))
+}
+
 /// Returns a map from commit_id → row index for fast edge resolution during rendering.
 pub fn build_commit_index(entries: &[JjLogEntry]) -> HashMap<SharedString, usize> {
     entries
