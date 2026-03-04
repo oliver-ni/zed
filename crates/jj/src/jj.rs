@@ -34,6 +34,7 @@ use jj_cli::{
 use jj_lib::{
     backend::CommitId,
     config::ConfigNamePathBuf,
+    git::REMOTE_NAME_FOR_LOCAL_GIT_REPO,
     graph::{GraphEdgeType, TopoGroupedGraphIterator},
     object_id::ObjectId as _,
     op_heads_store,
@@ -71,10 +72,56 @@ pub struct JjRevision {
     pub is_immutable: bool,
     pub has_conflict: bool,
     pub is_empty: bool,
-    /// Local bookmarks pointing at this revision.
-    pub bookmarks: Vec<SharedString>,
+    /// Bookmarks (local and remote) pointing at this revision.
+    ///
+    /// Locals come first, then remotes. A synced tracked remote (points at the
+    /// same commit as its local) is suppressed — the local chip already tells
+    /// you where it is.
+    pub bookmarks: Vec<JjBookmark>,
+    /// Names of workspaces whose `@` (working copy) is at this revision.
+    /// Usually empty or `["default"]`; multiple entries mean several
+    /// `jj workspace add`-created worktrees are all editing this commit.
+    pub workspaces: Vec<SharedString>,
     /// Full commit IDs of parents.
     pub parent_ids: Vec<SharedString>,
+}
+
+/// A bookmark reference attached to a revision.
+///
+/// Matches what `jj log` shows:
+///   - local, synced:   `main`
+///   - local, unsynced: `main*`   (tracked remote is somewhere else)
+///   - remote:          `main@origin`
+#[derive(Debug, Clone)]
+pub struct JjBookmark {
+    pub name: SharedString,
+    /// `None` for a local bookmark, `Some("origin")` for a remote-tracking ref.
+    pub remote: Option<SharedString>,
+    /// For a local bookmark: true if every tracked remote agrees with it
+    /// (no `*`). For a remote bookmark: true if it points at the same commit
+    /// as the local with the same name.
+    pub synced: bool,
+    /// Only meaningful for remote bookmarks: whether the user is tracking it
+    /// (`jj bookmark track name@remote`). Untracked remotes still render,
+    /// but tracked-and-synced remotes are suppressed entirely.
+    pub tracked: bool,
+}
+
+impl JjBookmark {
+    /// The label as `jj log` would render it: `name`, `name*`, or `name@remote`.
+    pub fn display(&self) -> SharedString {
+        match &self.remote {
+            Some(remote) => format!("{}@{}", self.name, remote).into(),
+            None if self.synced => self.name.clone(),
+            None => format!("{}*", self.name).into(),
+        }
+    }
+
+    /// Local bookmarks can be dragged to move them; remotes can't
+    /// (you move those with `jj git push`).
+    pub fn is_local(&self) -> bool {
+        self.remote.is_none()
+    }
 }
 
 /// One row of the laid-out log graph.
@@ -190,6 +237,17 @@ impl JjRepository {
     /// automatically rebased to follow.
     pub async fn rebase_revision(&self, source_change: &str, dest_change: &str) -> Result<()> {
         self.run_mutation(&["rebase", "-r", source_change, "-d", dest_change])
+            .await
+    }
+
+    /// `jj rebase -s <source> -d <destination>`
+    ///
+    /// Moves `source` **and all its descendants** onto `destination`. This is
+    /// what you usually want when dragging a commit around — the subtree
+    /// travels with it. (`-r` picks off just the one commit and reparents its
+    /// children onto its old parents.)
+    pub async fn rebase_branch(&self, source_change: &str, dest_change: &str) -> Result<()> {
+        self.run_mutation(&["rebase", "-s", source_change, "-d", dest_change])
             .await
     }
 
@@ -460,16 +518,16 @@ fn log_sync(workspace_root: &Path, revset_str: &str) -> Result<Vec<JjLogEntry>> 
 
     let is_immutable = session.immutable_containing_fn()?;
 
-    // CommitId → local bookmark names. Walk `local_bookmarks()` rather than
-    // `bookmarks()` so we skip remote refs — the panel only shows locals.
-    let mut bookmark_index: HashMap<CommitId, Vec<SharedString>> = HashMap::default();
-    for (name, target) in session.repo.view().local_bookmarks() {
-        for id in target.added_ids() {
-            bookmark_index
-                .entry(id.clone())
-                .or_default()
-                .push(SharedString::from(name.as_str().to_owned()));
-        }
+    let bookmark_index = build_bookmark_index(&session.repo);
+
+    // CommitId → workspace names. Typically a single entry (default → @) but
+    // `jj workspace add` creates more.
+    let mut workspace_index: HashMap<CommitId, Vec<SharedString>> = HashMap::default();
+    for (ws_name, commit_id) in session.repo.view().wc_commit_ids() {
+        workspace_index
+            .entry(commit_id.clone())
+            .or_default()
+            .push(SharedString::from(ws_name.as_str().to_owned()));
     }
 
     let revset = session.evaluate_revset(revset_str)?;
@@ -529,6 +587,10 @@ fn log_sync(workspace_root: &Path, revset_str: &str) -> Result<Vec<JjLogEntry>> 
             has_conflict: commit.has_conflict(),
             is_empty: commit.is_empty(session.repo.as_ref())?,
             bookmarks: bookmark_index.get(&commit_id).cloned().unwrap_or_default(),
+            workspaces: workspace_index
+                .get(&commit_id)
+                .cloned()
+                .unwrap_or_default(),
             parent_ids: commit.parent_ids().iter().map(|p| p.hex().into()).collect(),
         };
 
@@ -536,6 +598,77 @@ fn log_sync(workspace_root: &Path, revset_str: &str) -> Result<Vec<JjLogEntry>> 
     }
 
     Ok(layout_graph(rows))
+}
+
+/// Build a `CommitId → [JjBookmark]` index covering both local and remote refs.
+///
+/// Semantics follow `jj log`:
+///   - Local bookmarks always appear. `synced` is false (→ `*` suffix) if any
+///     tracked remote points elsewhere. The `git` pseudo-remote (colocated
+///     repos mirror local bookmarks into `.git/refs`) is ignored for this.
+///   - Remote bookmarks appear only where they *differ* from the local:
+///     untracked remotes always show; tracked remotes show only when the
+///     target diverged (tracked+synced would be noise on the same row as the
+///     local chip).
+///
+/// This is a direct port of GG's `build_ref_index`.
+fn build_bookmark_index(repo: &ReadonlyRepo) -> HashMap<CommitId, Vec<JjBookmark>> {
+    let mut index: HashMap<CommitId, Vec<JjBookmark>> = HashMap::default();
+
+    let mut insert = |ids: &mut dyn Iterator<Item = &CommitId>, bm: JjBookmark| {
+        for id in ids {
+            index.entry(id.clone()).or_default().push(bm.clone());
+        }
+    };
+
+    for (name, targets) in repo.view().bookmarks() {
+        let local = targets.local_target;
+        let remotes = targets.remote_refs;
+
+        if local.is_present() {
+            // Out of sync if any tracked real remote disagrees.
+            let synced = remotes.iter().all(|&(remote_name, remote_ref)| {
+                remote_name == REMOTE_NAME_FOR_LOCAL_GIT_REPO
+                    || !remote_ref.is_tracked()
+                    || remote_ref.target == *local
+            });
+            insert(
+                &mut local.added_ids(),
+                JjBookmark {
+                    name: name.as_str().to_owned().into(),
+                    remote: None,
+                    synced,
+                    tracked: true, // meaningless for locals, but keep it truthy
+                },
+            );
+        }
+
+        for &(remote_name, remote_ref) in &remotes {
+            if remote_name == REMOTE_NAME_FOR_LOCAL_GIT_REPO {
+                continue;
+            }
+            let synced = remote_ref.target == *local;
+            let tracked = remote_ref.is_tracked();
+            // Suppress tracked+synced: the local chip already covers it.
+            // Untracked remotes always show (they're independent refs the user
+            // hasn't opted into tracking). Local-absent always shows (no local
+            // chip to cover it).
+            if tracked && synced && local.is_present() {
+                continue;
+            }
+            insert(
+                &mut remote_ref.target.added_ids(),
+                JjBookmark {
+                    name: name.as_str().to_owned().into(),
+                    remote: Some(remote_name.as_str().to_owned().into()),
+                    synced,
+                    tracked,
+                },
+            );
+        }
+    }
+
+    index
 }
 
 // --- Lane layout -------------------------------------------------------------
@@ -713,6 +846,7 @@ mod tests {
             has_conflict: false,
             is_empty: false,
             bookmarks: vec![],
+            workspaces: vec![],
             parent_ids: vec![],
         }
     }

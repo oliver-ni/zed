@@ -6,7 +6,7 @@ use gpui::{
     Pixels, Point, SharedString, Subscription, Task, UniformListScrollHandle, WeakEntity, Window,
     anchored, canvas, deferred, div, point, px, uniform_list,
 };
-use jj::{JjGraphEdge, JjLogEntry, JjRepository};
+use jj::{JjBookmark, JjGraphEdge, JjLogEntry, JjRepository};
 use project::{Project, Worktree};
 use settings::Settings;
 use std::{ops::Range, sync::Arc};
@@ -361,13 +361,15 @@ impl JjPanel {
 
     // ─── Mutation wrappers (called from drag handlers & context menu) ─────
 
-    fn rebase(&mut self, source: SharedString, dest: SharedString, cx: &mut Context<Self>) {
+    /// Rebase `source` and its descendants onto `dest` (`jj rebase -s`).
+    /// This is the default drag-drop behavior — the subtree travels together.
+    fn rebase_branch(&mut self, source: SharedString, dest: SharedString, cx: &mut Context<Self>) {
         if source == dest {
             return;
         }
         self.run_mutation(
-            "rebase",
-            move |repo| async move { repo.rebase_revision(&source, &dest).await },
+            "rebase -s",
+            move |repo| async move { repo.rebase_branch(&source, &dest).await },
             cx,
         );
     }
@@ -556,9 +558,13 @@ impl JjPanel {
         // Graph slice for this row.
         let graph_cell = self.render_graph_cell(entry, graph_width, cx);
 
-        let bookmarks = rev.bookmarks.clone();
+        let bookmarks: Vec<JjBookmark> = rev.bookmarks.clone();
+        let workspaces = rev.workspaces.clone();
         let change_id_for_bm = rev.change_id.clone();
-        let short_commit = rev.short_commit_id.clone();
+        // Change IDs are stable across rewrites; that's the one you want to
+        // read & reference. Commit ID is still in the tooltip.
+        let display_id = rev.change_id.clone();
+        let tooltip_commit = rev.short_commit_id.clone();
         let author = rev.author_name.clone();
         let has_conflict = rev.has_conflict;
         let is_immutable = rev.is_immutable;
@@ -588,36 +594,85 @@ impl JjPanel {
                 el.hover(|el| el.bg(cx.theme().colors().element_hover.opacity(0.5)))
             })
             .child(graph_cell)
-            // ─── Bookmarks (draggable chips) ───────────────────────────
+            // ─── Workspace markers ───────────────────────────────────
+            // Rendered as `@name` chips. With a single workspace `default` this
+            // is redundant with the filled-circle node, so we skip that case.
+            .children(
+                workspaces
+                    .into_iter()
+                    .filter(|w| w.as_ref() != "default")
+                    .map(move |ws| {
+                        h_flex()
+                            .gap_0p5()
+                            .items_center()
+                            .px_1()
+                            .rounded_sm()
+                            .bg(cx.theme().colors().element_background)
+                            .border_1()
+                            .border_color(cx.theme().colors().border_variant)
+                            .child(
+                                Label::new(SharedString::from(format!("@{ws}")))
+                                    .size(LabelSize::XSmall)
+                                    .color(Color::Accent),
+                            )
+                    }),
+            )
+            // ─── Bookmarks (locals draggable, remotes inert) ──────────
             .children(bookmarks.into_iter().enumerate().map(move |(bm_ix, bm)| {
-                let bm_payload = DraggedJjBookmark {
-                    name: bm.clone(),
-                    from_change: change_id_for_bm.clone(),
+                let label = bm.display();
+                let is_local = bm.is_local();
+                // Local: blue accent, grab cursor, draggable.
+                // Remote (@origin): muted, default cursor, no drag.
+                let (bg, border, fg) = if is_local {
+                    (
+                        cx.theme().status().info_background,
+                        cx.theme().status().info_border,
+                        Color::Info,
+                    )
+                } else {
+                    (
+                        cx.theme().colors().element_background,
+                        cx.theme().colors().border_variant,
+                        Color::Muted,
+                    )
                 };
-                let bm_name = bm.clone();
-                h_flex()
+
+                let chip = h_flex()
                     .id(("jj-bookmark", ix as u64 * 1000 + bm_ix as u64))
                     .gap_0p5()
                     .items_center()
                     .px_1()
                     .rounded_sm()
-                    .bg(cx.theme().status().info_background)
+                    .bg(bg)
                     .border_1()
-                    .border_color(cx.theme().status().info_border)
-                    .cursor_grab()
+                    .border_color(border)
                     .child(
                         Icon::new(IconName::GitBranch)
                             .size(IconSize::XSmall)
-                            .color(Color::Info),
+                            .color(fg),
                     )
-                    .child(Label::new(bm).size(LabelSize::XSmall).color(Color::Info))
-                    .on_drag(bm_payload, move |payload, click_offset, _, cx| {
-                        cx.new(|_| DraggedJjBookmarkView {
-                            name: payload.name.clone(),
-                            click_offset,
+                    .child(Label::new(label.clone()).size(LabelSize::XSmall).color(fg));
+
+                if is_local {
+                    let bm_payload = DraggedJjBookmark {
+                        name: bm.name,
+                        from_change: change_id_for_bm.clone(),
+                    };
+                    chip.cursor_grab()
+                        .on_drag(bm_payload, move |payload, click_offset, _, cx| {
+                            cx.new(|_| DraggedJjBookmarkView {
+                                name: payload.name.clone(),
+                                click_offset,
+                            })
                         })
-                    })
-                    .tooltip(Tooltip::text(format!("Drag to move bookmark `{bm_name}`")))
+                        .tooltip(Tooltip::text(format!("Drag to move `{label}`")))
+                } else {
+                    chip.tooltip(Tooltip::text(if bm.tracked {
+                        format!("{label} (tracked remote, diverged)")
+                    } else {
+                        format!("{label} (untracked remote)")
+                    }))
+                }
             }))
             // ─── Description (main content, truncated) ─────────────────
             .child(
@@ -647,7 +702,7 @@ impl JjPanel {
                 )
             })
             .child(
-                Label::new(short_commit)
+                Label::new(display_id)
                     .size(LabelSize::XSmall)
                     .color(Color::Muted),
             )
@@ -655,10 +710,12 @@ impl JjPanel {
             // Suppress the hover tooltip while the context menu is open — otherwise
             // it renders on top of the menu and obscures the top entries.
             .when(self.context_menu.is_none(), |el| {
+                // change_id is in the visible column now; tooltip supplies the
+                // commit SHA (volatile across rewrites) and author.
                 el.tooltip(Tooltip::text(if author.is_empty() {
-                    format!("{target_change}")
+                    format!("commit {tooltip_commit}")
                 } else {
-                    format!("{target_change} · {author}")
+                    format!("commit {tooltip_commit} · {author}")
                 }))
             })
             // ─── Drag source: pick up a revision to rebase ─────────────
@@ -689,7 +746,9 @@ impl JjPanel {
                     this.drag_target_ix = None;
                     let source = dragged.change_id.clone();
                     let dest = target_change_for_rev.clone();
-                    this.rebase(source, dest, cx);
+                    // `-s`: subtree moves with the commit. `-r` (extract just
+                    // this one) is the oddball case, reachable from the menu.
+                    this.rebase_branch(source, dest, cx);
                 },
             ))
             // ─── Drop zone: receive a dragged bookmark (move) ──────────
